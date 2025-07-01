@@ -4,3 +4,10 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
+embassy-executor = "0.7.0"
+embassy-time = "0.4.0"
+esp-backtrace = { version = "0.16.0", features = ["println", "esp32", "panic-handler"] }
+esp-bootloader-esp-idf = "0.1.0"
+esp-hal = { version = "0.23.0", features = ["esp32", "unstable"] }
+esp-hal-embassy = { version = "0.6.0" , features = ["esp32"] }
+esp-println = { version = "0.14.0", features = ["esp32", "log-04"] }

@@ -40,18 +40,20 @@
         default = pkgs.mkShell {
           
           packages = with pkgs; [
-            rustToolchain
             cargo-watch
             rust-analyzer
             nixpkgs-fmt
             pkg-config
             openssl
+
+            espflash
+            espup
+            esptool 
           ];
 
-          
-          env = {
-            RUST_SRC_PATH = "${pkgs.rustToolchain}/lib/rustlib/src/rust/library";
-          };
+          shellHook = ''
+            source ./export-esp.sh
+          '';
         };
       });
     };

@@ -1,0 +1,24 @@
+[target.xtensa-esp32-none-elf]
+runner = "espflash flash --monitor --partition-table=partitions.csv"
+rustflags = [
+  "-C", "link-arg=-Wl,-Tlinkall.x",
+  "-C", "link-arg=-nostartfiles",
+]
+
+[env]
+ESP_LOG = "info"
+SSID = "SSID"
+PASSWORD = "PASSWORD"
+STATIC_IP = "1.1.1.1 "
+GATEWAY_IP = "1.1.1.1"
+HOST_IP = "1.1.1.1"
+
+[build]
+rustflags = [
+  "-C", "link-arg=-nostartfiles",
+]
+
+target = "xtensa-esp32-none-elf"
+
+[unstable]
+build-std = ["alloc", "core"]
