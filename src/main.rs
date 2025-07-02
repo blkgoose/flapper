@@ -13,13 +13,12 @@ use esp_alloc as _;
 use esp_backtrace as _;
 use esp_bootloader_esp_idf::partitions;
 use esp_hal::{clock::CpuClock, rng::Rng, timer::timg::TimerGroup};
-use esp_println::{print, println};
+use esp_println::println;
 use esp_storage::FlashStorage;
 use esp_wifi::{
     init,
     wifi::{
-        AccessPointConfiguration, ClientConfiguration, Configuration, WifiController, WifiDevice,
-        WifiEvent, WifiState,
+        AccessPointConfiguration, Configuration, WifiController, WifiDevice, WifiEvent, WifiState,
     },
     EspWifiController,
 };
