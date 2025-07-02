@@ -119,7 +119,14 @@ async fn main(spawner: Spawner) -> ! {
         init(timg0.timer0, rng.clone(), peripherals.RADIO_CLK).unwrap()
     );
 
-    let (controller, interfaces) = esp_wifi::wifi::new(&esp_wifi_ctrl, peripherals.WIFI).unwrap();
+    let (mut controller, interfaces) =
+        esp_wifi::wifi::new(&esp_wifi_ctrl, peripherals.WIFI).unwrap();
+
+    let ap_config = Configuration::AccessPoint(AccessPointConfiguration {
+        ssid: "esp-wifi".try_into().unwrap(),
+        ..Default::default()
+    });
+    controller.set_configuration(&ap_config).unwrap();
 
     let device = interfaces.ap;
 
@@ -137,7 +144,7 @@ async fn main(spawner: Spawner) -> ! {
     let seed = (rng.random() as u64) << 32 | rng.random() as u64;
 
     // Init network stack
-    let (stack, runner) = embassy_net::new(
+    let (ap_stack, ap_runner) = embassy_net::new(
         device,
         ap_config,
         mk_static!(StackResources<3>, StackResources::<3>::new()),
@@ -145,28 +152,28 @@ async fn main(spawner: Spawner) -> ! {
     );
 
     spawner.spawn(connection(controller)).ok();
-    spawner.spawn(net_task(runner)).ok();
-    spawner.spawn(run_dhcp(stack, AP_ADDR)).ok();
+    spawner.spawn(net_task(ap_runner)).ok();
+    spawner.spawn(run_dhcp(ap_stack, AP_ADDR)).ok();
 
     let mut rx_buffer = [0; 512];
     let mut tx_buffer = [0; 512];
 
     loop {
-        if stack.is_link_up() {
+        if ap_stack.is_link_up() {
             break;
         }
         Timer::after(Duration::from_millis(500)).await;
     }
     println!("Connect to the AP `esp-wifi` and point your browser to http://{AP_ADDR}:8080/");
     println!("DHCP is enabled so there's no need to configure a static IP, just in case:");
-    while !stack.is_config_up() {
+    while !ap_stack.is_config_up() {
         Timer::after(Duration::from_millis(100)).await
     }
-    stack
+    ap_stack
         .config_v4()
         .inspect(|c| println!("ipv4 config: {c:?}"));
 
-    let mut socket = TcpSocket::new(stack, &mut rx_buffer, &mut tx_buffer);
+    let mut socket = TcpSocket::new(ap_stack, &mut rx_buffer, &mut tx_buffer);
     socket.set_timeout(Some(embassy_time::Duration::from_secs(10)));
 
     loop {
@@ -364,14 +371,7 @@ async fn connection(mut controller: WifiController<'static>) {
             _ => {}
         }
         if !matches!(controller.is_started(), Ok(true)) {
-            let client_config = Configuration::AccessPoint(AccessPointConfiguration {
-                ssid: "esp-wifi".try_into().unwrap(),
-                ..Default::default()
-            });
-            controller.set_configuration(&client_config).unwrap();
-            println!("Starting wifi");
             controller.start_async().await.unwrap();
-            println!("Wifi started!");
         }
     }
 }
