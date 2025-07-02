@@ -703,6 +703,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "esp-storage"
+version = "0.6.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5b6502654e5750e8162e66512d7e8d84f7eb51d17ec6aa7e0da95cd102769425"
+dependencies = [
+ "critical-section",
+ "document-features",
+ "embedded-storage",
+ "esp-build",
+ "esp-metadata",
+]
+
+[[package]]
 name = "esp-wifi"
 version = "0.14.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -764,12 +777,14 @@ dependencies = [
  "embassy-time",
  "embedded-io",
  "embedded-io-async",
+ "embedded-storage",
  "esp-alloc",
  "esp-backtrace",
  "esp-bootloader-esp-idf",
  "esp-hal",
  "esp-hal-embassy",
  "esp-println",
+ "esp-storage",
  "esp-wifi",
  "log",
  "smoltcp",
