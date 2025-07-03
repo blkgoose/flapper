@@ -26,6 +26,7 @@ static_cell         = { version = "2.1.0" }
 embassy-futures = "0.1.1"
 embedded-storage = "0.3.1"
 esp-storage = { version = "0.6.0", features = ["esp32"] }
+base64 = { version="0.13.0", default-features = false, features = ["alloc"] }
 
 [profile.dev]
 opt-level = 3

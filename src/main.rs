@@ -1,8 +1,13 @@
 #![no_std]
 #![no_main]
 
+// TODOs:
+// * move all nvs login inside "Data" struct
+// *
+
 extern crate alloc;
 use alloc::string::String;
+use alloc::vec::Vec;
 use core::{net::Ipv4Addr, str::FromStr};
 
 use embassy_executor::Spawner;
@@ -39,6 +44,96 @@ macro_rules! mk_static {
 
 const MAX_STORAGE: usize = 256;
 const AP_ADDR: &str = "192.168.2.1";
+const SSID_LEN: usize = 32;
+const PASSWORD_LEN: usize = 128;
+const MAX_STA_FAILS: u8 = 3;
+
+#[derive(Clone, Debug, Default)]
+pub struct Data {
+    pub ssid: String,
+    pub password: String,
+    pub fail_counter: u8,
+}
+
+impl Data {
+    pub fn from_str(buffer: &[u8]) -> Self {
+        // Ensure buffer is large enough
+        if buffer.len() < SSID_LEN + PASSWORD_LEN + 1 {
+            return Self::default();
+        }
+
+        // Extract and trim SSID and password (remove trailing zeroes)
+        let ssid_bytes = &buffer[0..SSID_LEN];
+        let password_bytes = &buffer[SSID_LEN..SSID_LEN + PASSWORD_LEN];
+
+        let ssid = ssid_bytes
+            .iter()
+            .take_while(|&&b| b != 0)
+            .cloned()
+            .collect::<Vec<u8>>();
+        let password = password_bytes
+            .iter()
+            .take_while(|&&b| b != 0)
+            .cloned()
+            .collect::<Vec<u8>>();
+
+        let ssid_string = String::from_utf8_lossy(&ssid).into();
+        let password_string = String::from_utf8_lossy(&password).into();
+
+        let fail_counter = buffer[SSID_LEN + PASSWORD_LEN];
+
+        Self {
+            ssid: ssid_string,
+            password: password_string,
+            fail_counter,
+        }
+    }
+
+    pub fn to_bytes(&self) -> [u8; MAX_STORAGE] {
+        let mut bytes = [0u8; MAX_STORAGE];
+        let ssid_bytes = self.ssid.as_bytes();
+        let password_bytes = self.password.as_bytes();
+
+        // Copy SSID
+        bytes[..ssid_bytes.len()].copy_from_slice(ssid_bytes);
+        // Null-terminate SSID
+        if ssid_bytes.len() < SSID_LEN {
+            bytes[ssid_bytes.len()] = 0;
+        }
+
+        // Copy Password
+        bytes[SSID_LEN..SSID_LEN + password_bytes.len()].copy_from_slice(password_bytes);
+        // Null-terminate Password
+        if password_bytes.len() < PASSWORD_LEN {
+            bytes[SSID_LEN + password_bytes.len()] = 0;
+        }
+
+        // Store fail counter
+        bytes[SSID_LEN + PASSWORD_LEN] = self.fail_counter;
+
+        bytes
+    }
+
+    pub fn is_valid(&self) -> bool {
+        !self.ssid.is_empty() && !self.password.is_empty() && self.fail_counter <= MAX_STA_FAILS
+    }
+
+    pub fn incr_fail_counter(&self) -> Self {
+        let mut new_data = self.clone();
+        if new_data.fail_counter < u8::MAX {
+            new_data.fail_counter += 1;
+        }
+        new_data
+    }
+
+    fn new(ssid: &str, password: &str) -> Self {
+        Self {
+            ssid: ssid.into(),
+            password: password.into(),
+            fail_counter: 0,
+        }
+    }
+}
 
 #[esp_hal_embassy::main]
 async fn main(spawner: Spawner) -> ! {
@@ -50,7 +145,6 @@ async fn main(spawner: Spawner) -> ! {
 
     // FLASH STORAGE CONFIGURATION
     let mut flash = FlashStorage::new();
-    println!("Flash size = {}", flash.capacity());
 
     let mut pt_mem = [0u8; partitions::PARTITION_TABLE_MAX_LEN];
     let pt = partitions::read_partition_table(&mut flash, &mut pt_mem).unwrap();
@@ -65,54 +159,8 @@ async fn main(spawner: Spawner) -> ! {
 
     let mut bytes = [0u8; MAX_STORAGE];
     nvs_partition.read(0, &mut bytes).unwrap();
-    let sep = bytes.iter().position(|&b| b == 1);
-    let end = bytes.iter().position(|&b| b == 0);
 
-    println!(
-        "Read {} bytes from NVS partition, sep: {:?}, end: {:?}",
-        bytes.len(),
-        sep,
-        end
-    );
-
-    let mut credentials = None;
-    match (sep, end) {
-        (Some(sep), Some(end)) if sep < end => {
-            let ssid_raw = &bytes[..sep];
-            let pass_raw = &bytes[sep + 1..end];
-
-            let ssid = core::str::from_utf8(ssid_raw).ok().and_then(|s| {
-                if s.is_empty() {
-                    None
-                } else {
-                    Some(s)
-                }
-            });
-            let password = core::str::from_utf8(pass_raw).ok().and_then(|s| {
-                if s.is_empty() {
-                    None
-                } else {
-                    Some(s)
-                }
-            });
-
-            if let (Some(ssid), Some(password)) = (ssid, password) {
-                credentials = Some((ssid, password));
-            }
-        }
-        (Some(sep), Some(end)) if sep >= end => {
-            println!("Corrupt memory, cleaning...");
-            nvs_partition.write(0, &[0u8; MAX_STORAGE]).unwrap();
-            Timer::after(Duration::from_secs(5)).await;
-            esp_hal::system::software_reset();
-        }
-        _ => {
-            println!("No credentials found in NVS, open the AP");
-        }
-    };
-    // FLASH STORAGE CONFIGURATION END
-
-    println!("credentials in NVS: {:?}", credentials);
+    let data = Data::from_str(&bytes);
 
     let timg0 = TimerGroup::new(peripherals.TIMG0);
     let mut rng = Rng::new(peripherals.RNG);
@@ -126,13 +174,14 @@ async fn main(spawner: Spawner) -> ! {
         esp_wifi::wifi::new(&esp_wifi_ctrl, peripherals.WIFI).unwrap();
 
     let ap_config = AccessPointConfiguration {
-        ssid: "esp-wifi".try_into().unwrap(),
+        ssid: "flapper".try_into().unwrap(),
         ..Default::default()
     };
 
     let config = Configuration::AccessPoint(ap_config.clone());
     controller.set_configuration(&config).unwrap();
     controller.start_async().await.unwrap(); // AP ONLY
+    println!("Started control panel AP");
 
     let device = interfaces.ap;
 
@@ -157,16 +206,34 @@ async fn main(spawner: Spawner) -> ! {
         seed,
     );
 
-    if let Some((ssid, password)) = credentials {
-        println!("Connecting to SSID: {}, Password: {}", ssid, password);
-        spawner
-            .spawn(connect_sta_task(
-                ap_config,
-                controller,
-                ssid.into(),
-                password.into(),
-            ))
-            .ok();
+    if data.is_valid() {
+        println!(
+            "Connecting to SSID: {}, Password: {}, Try: {}",
+            data.ssid, data.password, data.fail_counter
+        );
+        let sta_connection_result = connect_sta_task(
+            ap_config,
+            controller,
+            data.ssid.clone(),
+            data.password.clone(),
+        )
+        .await;
+
+        match sta_connection_result {
+            Ok(_) => {
+                println!("Connected to STA successfully");
+            }
+            Err(_) => {
+                println!("Failed to connect to STA, saving to memory and restarting");
+
+                let u_data = data.incr_fail_counter();
+
+                nvs_partition.write(0, &u_data.to_bytes()).unwrap();
+                println!("Failure saved to NVS");
+                println!("Restarting...");
+                esp_hal::system::software_reset();
+            }
+        }
     }
 
     spawner.spawn(net_task(ap_runner)).ok();
@@ -181,8 +248,6 @@ async fn main(spawner: Spawner) -> ! {
         }
         Timer::after(Duration::from_millis(500)).await;
     }
-    println!("Connect to the AP `esp-wifi` and point your browser to http://{AP_ADDR}:8080/");
-    println!("DHCP is enabled so there's no need to configure a static IP, just in case:");
     while !ap_stack.is_config_up() {
         Timer::after(Duration::from_millis(100)).await
     }
@@ -198,7 +263,7 @@ async fn main(spawner: Spawner) -> ! {
         let r = socket
             .accept(IpListenEndpoint {
                 addr: None,
-                port: 8080,
+                port: 80,
             })
             .await;
         println!("Connected...");
@@ -279,16 +344,19 @@ async fn main(spawner: Spawner) -> ! {
                     _ => {}
                 }
             }
+
+            // TODO: make this shit readable
+            let ssid_from_base64 = base64::decode(ssid).unwrap_or_default();
+            ssid = core::str::from_utf8(&ssid_from_base64).unwrap_or_default();
+            let password_from_base64 = base64::decode(password).unwrap_or_default();
+            password = core::str::from_utf8(&password_from_base64).unwrap_or_default();
+
             println!("SSID: {}", ssid);
             println!("Password: {}", password);
 
             // Save to NVS
-            let mut bytes = [0u8; MAX_STORAGE];
-            bytes[..ssid.len()].copy_from_slice(ssid.as_bytes());
-            bytes[ssid.len()] = 1; // Separator
-            bytes[ssid.len() + 1..ssid.len() + 1 + password.len()]
-                .copy_from_slice(password.as_bytes());
-            nvs_partition.write(0, &bytes).unwrap();
+            let d = Data::new(ssid, password);
+            nvs_partition.write(0, &d.to_bytes()).unwrap();
             println!("Credentials saved to NVS");
 
             // Respond with a confirmation page
@@ -312,13 +380,22 @@ async fn main(spawner: Spawner) -> ! {
                     b"HTTP/1.0 200 OK\r\n\r\n\
                 <html>\
                     <body>\
-                        <form action='http://192.168.2.1:8080' method='post'>\
+                        <form action='http://192.168.2.1' method='post' accept-charset='utf-8' onsubmit='encryptFields'>\
                             <label for='ssid'>SSID:</label>\
                             <input type='text' id='ssid' name='ssid'><br><br>\
                             <label for='password'>Password:</label>\
                             <input type='password' id='password' name='password'><br><br>\
                             <input type='submit' value='Submit'>\
                         </form>\
+                        <script>\
+                            function encryptFields(e) {\
+                                const ssidField = document.getElementById('ssid');\
+                                const passwordField = document.getElementById('password');\
+                                ssidField.value = btoa(ssidField.value);\
+                                passwordField.value = btoa(passwordField.value);\
+                                e.target.submit();\
+                            }\
+                        </script>\
                     </body>\
                 </html>\r\n\
                 ",
@@ -334,13 +411,12 @@ async fn main(spawner: Spawner) -> ! {
     }
 }
 
-#[embassy_executor::task]
 async fn connect_sta_task(
     ap_config: AccessPointConfiguration,
     mut controller: WifiController<'static>,
     ssid: String,
     password: String,
-) {
+) -> Result<(), ()> {
     println!("Connecting to SSID: {}, Password: {}", ssid, password);
 
     let sta_cfg = ClientConfiguration {
@@ -353,24 +429,15 @@ async fn connect_sta_task(
         .unwrap();
 
     println!("Starting STA mode...");
-    let connect_result = with_timeout(
+    with_timeout(
         Duration::from_secs(10),
         controller.wait_for_event(WifiEvent::StaConnected),
     )
-    .await;
-    match connect_result {
-        Ok(()) => println!("STA connected!"),
-        Err(_) => {
-            println!("STA failed to connect within timeout, returning to AP mode only");
-            controller
-                .set_configuration(&Configuration::AccessPoint(ap_config))
-                .unwrap();
-            println!("Restarting controller...");
-            controller.stop_async().await.unwrap();
-            controller.start_async().await.unwrap();
-            println!("Controller restarted, now in AP mode only");
-        }
-    }
+    .await
+    .map_err(|_| {
+        println!("STA connection timed out");
+        ()
+    })
 }
 
 #[embassy_executor::task]
