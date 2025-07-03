@@ -1,13 +1,15 @@
 #![no_std]
 #![no_main]
 
+extern crate alloc;
+use alloc::string::String;
 use core::{net::Ipv4Addr, str::FromStr};
 
 use embassy_executor::Spawner;
 use embassy_net::{
     tcp::TcpSocket, IpListenEndpoint, Ipv4Cidr, Runner, Stack, StackResources, StaticConfigV4,
 };
-use embassy_time::{Duration, Timer};
+use embassy_time::{with_timeout, Duration, Timer};
 use embedded_storage::{ReadStorage, Storage};
 use esp_alloc as _;
 use esp_backtrace as _;
@@ -18,7 +20,8 @@ use esp_storage::FlashStorage;
 use esp_wifi::{
     init,
     wifi::{
-        AccessPointConfiguration, Configuration, WifiController, WifiDevice, WifiEvent, WifiState,
+        AccessPointConfiguration, ClientConfiguration, Configuration, WifiController, WifiDevice,
+        WifiEvent,
     },
     EspWifiController,
 };
@@ -122,11 +125,14 @@ async fn main(spawner: Spawner) -> ! {
     let (mut controller, interfaces) =
         esp_wifi::wifi::new(&esp_wifi_ctrl, peripherals.WIFI).unwrap();
 
-    let ap_config = Configuration::AccessPoint(AccessPointConfiguration {
+    let ap_config = AccessPointConfiguration {
         ssid: "esp-wifi".try_into().unwrap(),
         ..Default::default()
-    });
-    controller.set_configuration(&ap_config).unwrap();
+    };
+
+    let config = Configuration::AccessPoint(ap_config.clone());
+    controller.set_configuration(&config).unwrap();
+    controller.start_async().await.unwrap(); // AP ONLY
 
     let device = interfaces.ap;
 
@@ -135,7 +141,7 @@ async fn main(spawner: Spawner) -> ! {
 
     let ap_ip_addr = Ipv4Addr::from_str(AP_ADDR).expect("failed to parse gateway ip");
 
-    let ap_config = embassy_net::Config::ipv4_static(StaticConfigV4 {
+    let ap_stack_config = embassy_net::Config::ipv4_static(StaticConfigV4 {
         address: Ipv4Cidr::new(ap_ip_addr, 24),
         gateway: Some(ap_ip_addr),
         dns_servers: Default::default(),
@@ -146,12 +152,23 @@ async fn main(spawner: Spawner) -> ! {
     // Init network stack
     let (ap_stack, ap_runner) = embassy_net::new(
         device,
-        ap_config,
+        ap_stack_config,
         mk_static!(StackResources<3>, StackResources::<3>::new()),
         seed,
     );
 
-    spawner.spawn(connection(controller)).ok();
+    if let Some((ssid, password)) = credentials {
+        println!("Connecting to SSID: {}, Password: {}", ssid, password);
+        spawner
+            .spawn(connect_sta_task(
+                ap_config,
+                controller,
+                ssid.into(),
+                password.into(),
+            ))
+            .ok();
+    }
+
     spawner.spawn(net_task(ap_runner)).ok();
     spawner.spawn(run_dhcp(ap_stack, AP_ADDR)).ok();
 
@@ -318,6 +335,45 @@ async fn main(spawner: Spawner) -> ! {
 }
 
 #[embassy_executor::task]
+async fn connect_sta_task(
+    ap_config: AccessPointConfiguration,
+    mut controller: WifiController<'static>,
+    ssid: String,
+    password: String,
+) {
+    println!("Connecting to SSID: {}, Password: {}", ssid, password);
+
+    let sta_cfg = ClientConfiguration {
+        ssid: ssid.into(),
+        password: password.into(),
+        ..Default::default()
+    };
+    controller
+        .set_configuration(&Configuration::Mixed(sta_cfg, ap_config.clone()))
+        .unwrap();
+
+    println!("Starting STA mode...");
+    let connect_result = with_timeout(
+        Duration::from_secs(10),
+        controller.wait_for_event(WifiEvent::StaConnected),
+    )
+    .await;
+    match connect_result {
+        Ok(()) => println!("STA connected!"),
+        Err(_) => {
+            println!("STA failed to connect within timeout, returning to AP mode only");
+            controller
+                .set_configuration(&Configuration::AccessPoint(ap_config))
+                .unwrap();
+            println!("Restarting controller...");
+            controller.stop_async().await.unwrap();
+            controller.start_async().await.unwrap();
+            println!("Controller restarted, now in AP mode only");
+        }
+    }
+}
+
+#[embassy_executor::task]
 async fn run_dhcp(stack: Stack<'static>, gw_ip_addr: &'static str) {
     use core::net::{Ipv4Addr, SocketAddrV4};
 
@@ -354,25 +410,6 @@ async fn run_dhcp(stack: Stack<'static>, gw_ip_addr: &'static str) {
         .await
         .inspect_err(|e| log::warn!("DHCP server error: {e:?}"));
         Timer::after(Duration::from_millis(500)).await;
-    }
-}
-
-#[embassy_executor::task]
-async fn connection(mut controller: WifiController<'static>) {
-    println!("start connection task");
-    println!("Device capabilities: {:?}", controller.capabilities());
-    loop {
-        match esp_wifi::wifi::wifi_state() {
-            WifiState::ApStarted => {
-                // wait until we're no longer connected
-                controller.wait_for_event(WifiEvent::ApStop).await;
-                Timer::after(Duration::from_millis(5000)).await
-            }
-            _ => {}
-        }
-        if !matches!(controller.is_started(), Ok(true)) {
-            controller.start_async().await.unwrap();
-        }
     }
 }
 
