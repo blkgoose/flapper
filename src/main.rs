@@ -30,6 +30,9 @@ use esp_wifi::{
     },
     EspWifiController,
 };
+
+use percent_encoding::percent_decode_str;
+
 esp_bootloader_esp_idf::esp_app_desc!();
 
 // When you are okay with using a nightly compiler it's better to use https://docs.rs/static_cell/2.1.0/static_cell/macro.make_static.html
@@ -263,7 +266,7 @@ async fn main(spawner: Spawner) -> ! {
         let r = socket
             .accept(IpListenEndpoint {
                 addr: None,
-                port: 80,
+                port: 8080,
             })
             .await;
         println!("Connected...");
@@ -334,28 +337,32 @@ async fn main(spawner: Spawner) -> ! {
             let form_data = core::str::from_utf8(body).unwrap_or("");
             println!("POST form data: {}", form_data);
 
-            let mut ssid = "";
-            let mut password = "";
+            let mut ssid = String::new();
+            let mut password = String::new();
             for pair in form_data.split('&') {
                 let mut iter = pair.splitn(2, '=');
                 match (iter.next(), iter.next()) {
-                    (Some("ssid"), Some(val)) => ssid = val,
-                    (Some("password"), Some(val)) => password = val,
+                    (Some("ssid"), Some(val)) => {
+                        ssid = percent_decode_str(val)
+                            .decode_utf8()
+                            .unwrap_or_default()
+                            .into_owned()
+                    }
+                    (Some("password"), Some(val)) => {
+                        password = percent_decode_str(val)
+                            .decode_utf8()
+                            .unwrap_or_default()
+                            .into_owned()
+                    }
                     _ => {}
                 }
             }
-
-            // TODO: make this shit readable
-            let ssid_from_base64 = base64::decode(ssid).unwrap_or_default();
-            ssid = core::str::from_utf8(&ssid_from_base64).unwrap_or_default();
-            let password_from_base64 = base64::decode(password).unwrap_or_default();
-            password = core::str::from_utf8(&password_from_base64).unwrap_or_default();
 
             println!("SSID: {}", ssid);
             println!("Password: {}", password);
 
             // Save to NVS
-            let d = Data::new(ssid, password);
+            let d = Data::new(&ssid, &password);
             nvs_partition.write(0, &d.to_bytes()).unwrap();
             println!("Credentials saved to NVS");
 
@@ -380,22 +387,13 @@ async fn main(spawner: Spawner) -> ! {
                     b"HTTP/1.0 200 OK\r\n\r\n\
                 <html>\
                     <body>\
-                        <form action='http://192.168.2.1' method='post' accept-charset='utf-8' onsubmit='encryptFields'>\
+                        <form method='post'>\
                             <label for='ssid'>SSID:</label>\
                             <input type='text' id='ssid' name='ssid'><br><br>\
                             <label for='password'>Password:</label>\
                             <input type='password' id='password' name='password'><br><br>\
                             <input type='submit' value='Submit'>\
                         </form>\
-                        <script>\
-                            function encryptFields(e) {\
-                                const ssidField = document.getElementById('ssid');\
-                                const passwordField = document.getElementById('password');\
-                                ssidField.value = btoa(ssidField.value);\
-                                passwordField.value = btoa(passwordField.value);\
-                                e.target.submit();\
-                            }\
-                        </script>\
                     </body>\
                 </html>\r\n\
                 ",
@@ -417,25 +415,22 @@ async fn connect_sta_task(
     ssid: String,
     password: String,
 ) -> Result<(), ()> {
-    println!("Connecting to SSID: {}, Password: {}", ssid, password);
-
     let sta_cfg = ClientConfiguration {
-        ssid: ssid.into(),
-        password: password.into(),
+        ssid,
+        password,
         ..Default::default()
     };
     controller
         .set_configuration(&Configuration::Mixed(sta_cfg, ap_config.clone()))
         .unwrap();
 
-    println!("Starting STA mode...");
     with_timeout(
         Duration::from_secs(10),
         controller.wait_for_event(WifiEvent::StaConnected),
     )
     .await
-    .map_err(|_| {
-        println!("STA connection timed out");
+    .map_err(|e| {
+        println!("Timeout while waiting for STA connection: {:?}", e);
         ()
     })
 }
