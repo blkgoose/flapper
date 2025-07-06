@@ -1,20 +1,16 @@
 #![no_std]
 #![no_main]
 
-// TODOs:
-// * move all nvs login inside "Data" struct
-// *
-
 extern crate alloc;
 use alloc::string::String;
 use alloc::vec::Vec;
-use core::{net::Ipv4Addr, str::FromStr};
+use core::net::Ipv4Addr;
 
 use embassy_executor::Spawner;
 use embassy_net::{
-    tcp::TcpSocket, IpListenEndpoint, Ipv4Cidr, Runner, Stack, StackResources, StaticConfigV4,
+    tcp::TcpSocket, IpListenEndpoint, Ipv4Cidr, Runner, StackResources, StaticConfigV4,
 };
-use embassy_time::{with_timeout, Duration, Timer};
+use embassy_time::{Duration, Timer};
 use embedded_storage::{ReadStorage, Storage};
 use esp_alloc as _;
 use esp_backtrace as _;
@@ -26,7 +22,7 @@ use esp_wifi::{
     init,
     wifi::{
         AccessPointConfiguration, ClientConfiguration, Configuration, WifiController, WifiDevice,
-        WifiEvent,
+        WifiEvent, WifiState,
     },
     EspWifiController,
 };
@@ -34,6 +30,13 @@ use esp_wifi::{
 use percent_encoding::percent_decode_str;
 
 esp_bootloader_esp_idf::esp_app_desc!();
+
+const AP_NAME: &str = "flapper";
+const SSID_LEN: usize = 32;
+const PASSWORD_LEN: usize = 128;
+const MAX_STA_FAILS: u8 = 3;
+const MAX_STORAGE: usize = SSID_LEN + PASSWORD_LEN + 1;
+const BUFFER_SIZE: usize = 256;
 
 // When you are okay with using a nightly compiler it's better to use https://docs.rs/static_cell/2.1.0/static_cell/macro.make_static.html
 macro_rules! mk_static {
@@ -44,12 +47,6 @@ macro_rules! mk_static {
         x
     }};
 }
-
-const MAX_STORAGE: usize = 256;
-const AP_ADDR: &str = "192.168.2.1";
-const SSID_LEN: usize = 32;
-const PASSWORD_LEN: usize = 128;
-const MAX_STA_FAILS: u8 = 3;
 
 #[derive(Clone, Debug, Default)]
 pub struct Data {
@@ -121,12 +118,10 @@ impl Data {
         !self.ssid.is_empty() && !self.password.is_empty() && self.fail_counter <= MAX_STA_FAILS
     }
 
-    pub fn incr_fail_counter(&self) -> Self {
-        let mut new_data = self.clone();
-        if new_data.fail_counter < u8::MAX {
-            new_data.fail_counter += 1;
+    pub fn incr_fail_counter(&mut self) {
+        if self.fail_counter < u8::MAX {
+            self.fail_counter += 1;
         }
-        new_data
     }
 
     fn new(ssid: &str, password: &str) -> Self {
@@ -144,9 +139,8 @@ async fn main(spawner: Spawner) -> ! {
     let config = esp_hal::Config::default().with_cpu_clock(CpuClock::max());
     let peripherals = esp_hal::init(config);
 
-    esp_alloc::heap_allocator!(size: 48 * 1024);
+    esp_alloc::heap_allocator!(size: 72 * 1024);
 
-    // FLASH STORAGE CONFIGURATION
     let mut flash = FlashStorage::new();
 
     let mut pt_mem = [0u8; partitions::PARTITION_TABLE_MAX_LEN];
@@ -163,7 +157,9 @@ async fn main(spawner: Spawner) -> ! {
     let mut bytes = [0u8; MAX_STORAGE];
     nvs_partition.read(0, &mut bytes).unwrap();
 
-    let data = Data::from_str(&bytes);
+    let mut data = Data::from_str(&bytes);
+
+    println!("data: {:?}", data);
 
     let timg0 = TimerGroup::new(peripherals.TIMG0);
     let mut rng = Rng::new(peripherals.RNG);
@@ -176,74 +172,85 @@ async fn main(spawner: Spawner) -> ! {
     let (mut controller, interfaces) =
         esp_wifi::wifi::new(&esp_wifi_ctrl, peripherals.WIFI).unwrap();
 
-    let ap_config = AccessPointConfiguration {
-        ssid: "flapper".try_into().unwrap(),
-        ..Default::default()
-    };
-
-    let config = Configuration::AccessPoint(ap_config.clone());
-    controller.set_configuration(&config).unwrap();
-    controller.start_async().await.unwrap(); // AP ONLY
-    println!("Started control panel AP");
-
-    let device = interfaces.ap;
+    let wifi_ap_device = interfaces.ap;
+    let wifi_sta_device = interfaces.sta;
 
     let timg1 = TimerGroup::new(peripherals.TIMG1);
     esp_hal_embassy::init(timg1.timer0);
 
-    let ap_ip_addr = Ipv4Addr::from_str(AP_ADDR).expect("failed to parse gateway ip");
-
-    let ap_stack_config = embassy_net::Config::ipv4_static(StaticConfigV4 {
-        address: Ipv4Cidr::new(ap_ip_addr, 24),
-        gateway: Some(ap_ip_addr),
+    let ap_config = embassy_net::Config::ipv4_static(StaticConfigV4 {
+        address: Ipv4Cidr::new(Ipv4Addr::new(192, 168, 2, 1), 24),
+        gateway: Some(Ipv4Addr::new(192, 168, 2, 1)),
         dns_servers: Default::default(),
     });
+    let sta_config = embassy_net::Config::dhcpv4(Default::default());
 
     let seed = (rng.random() as u64) << 32 | rng.random() as u64;
 
-    // Init network stack
+    // Init network stacks
     let (ap_stack, ap_runner) = embassy_net::new(
-        device,
-        ap_stack_config,
+        wifi_ap_device,
+        ap_config,
         mk_static!(StackResources<3>, StackResources::<3>::new()),
         seed,
     );
+    let (sta_stack, sta_runner) = embassy_net::new(
+        wifi_sta_device,
+        sta_config,
+        mk_static!(StackResources<4>, StackResources::<4>::new()),
+        seed,
+    );
 
-    if data.is_valid() {
-        println!(
-            "Connecting to SSID: {}, Password: {}, Try: {}",
-            data.ssid, data.password, data.fail_counter
-        );
-        let sta_connection_result = connect_sta_task(
-            ap_config,
-            controller,
-            data.ssid.clone(),
-            data.password.clone(),
+    let ap_only_mode = !data.is_valid();
+    let client_config = if ap_only_mode {
+        Configuration::AccessPoint(AccessPointConfiguration {
+            ssid: AP_NAME.into(),
+            ..Default::default()
+        })
+    } else {
+        Configuration::Mixed(
+            ClientConfiguration {
+                ssid: data.ssid.clone(),
+                password: data.password.clone(),
+                ..Default::default()
+            },
+            AccessPointConfiguration {
+                ssid: AP_NAME.into(),
+                ..Default::default()
+            },
         )
-        .await;
+    };
 
-        match sta_connection_result {
-            Ok(_) => {
-                println!("Connected to STA successfully");
-            }
-            Err(_) => {
-                println!("Failed to connect to STA, saving to memory and restarting");
+    controller.set_configuration(&client_config).unwrap();
 
-                let u_data = data.incr_fail_counter();
+    spawner.spawn(connection(controller)).ok();
+    spawner.spawn(net_task(ap_runner)).ok();
+    if !ap_only_mode {
+        spawner.spawn(net_task(sta_runner)).ok();
 
-                nvs_partition.write(0, &u_data.to_bytes()).unwrap();
-                println!("Failure saved to NVS");
-                println!("Restarting...");
+        let sta_address = loop {
+            if !data.is_valid() {
+                println!("Cannot connect to STA, restarting in AP mode only");
+                nvs_partition.write(0, &data.to_bytes()).unwrap();
                 esp_hal::system::software_reset();
             }
-        }
+
+            println!(
+                "Trying to connect to {} (try #{})",
+                data.ssid,
+                data.fail_counter + 1
+            );
+            Timer::after(Duration::from_secs(5)).await;
+            if let Some(config) = sta_stack.config_v4() {
+                let address = config.address.address();
+                println!("Got IP: {}", address);
+                break address;
+            }
+            data.incr_fail_counter();
+        };
+
+        println!("Connected to STA with IP: {}", sta_address);
     }
-
-    spawner.spawn(net_task(ap_runner)).ok();
-    spawner.spawn(run_dhcp(ap_stack, AP_ADDR)).ok();
-
-    let mut rx_buffer = [0; 512];
-    let mut tx_buffer = [0; 512];
 
     loop {
         if ap_stack.is_link_up() {
@@ -251,39 +258,43 @@ async fn main(spawner: Spawner) -> ! {
         }
         Timer::after(Duration::from_millis(500)).await;
     }
-    while !ap_stack.is_config_up() {
-        Timer::after(Duration::from_millis(100)).await
-    }
-    ap_stack
-        .config_v4()
-        .inspect(|c| println!("ipv4 config: {c:?}"));
+    let mut ap_server_rx_buffer = [0; BUFFER_SIZE];
+    let mut ap_server_tx_buffer = [0; BUFFER_SIZE];
+    let mut sta_client_rx_buffer = [0; BUFFER_SIZE];
+    let mut sta_client_tx_buffer = [0; BUFFER_SIZE];
 
-    let mut socket = TcpSocket::new(ap_stack, &mut rx_buffer, &mut tx_buffer);
-    socket.set_timeout(Some(embassy_time::Duration::from_secs(10)));
+    let mut ap_server_socket =
+        TcpSocket::new(ap_stack, &mut ap_server_rx_buffer, &mut ap_server_tx_buffer);
+    ap_server_socket.set_timeout(Some(embassy_time::Duration::from_secs(10)));
+
+    let mut sta_client_socket = TcpSocket::new(
+        sta_stack,
+        &mut sta_client_rx_buffer,
+        &mut sta_client_tx_buffer,
+    );
+    sta_client_socket.set_timeout(Some(embassy_time::Duration::from_secs(10)));
 
     loop {
         println!("Wait for connection...");
-        let r = socket
+        ap_server_socket
             .accept(IpListenEndpoint {
                 addr: None,
                 port: 8080,
             })
-            .await;
+            .await
+            .expect("AP accept failed");
+
+        let server_socket = &mut ap_server_socket;
         println!("Connected...");
 
-        if let Err(e) = r {
-            println!("connect error: {:?}", e);
-            continue;
-        }
-
         use embedded_io_async::Write;
-
         let mut buffer = [0u8; 1024];
+
         let mut total_len = 0;
         let mut headers_end = None;
 
         while total_len < buffer.len() {
-            match socket.read(&mut buffer[total_len..]).await {
+            match server_socket.read(&mut buffer[total_len..]).await {
                 Ok(0) => break,
                 Ok(n) => {
                     total_len += n;
@@ -323,7 +334,7 @@ async fn main(spawner: Spawner) -> ! {
 
         let body_start = headers_end;
         while is_post && (total_len - body_start) < content_length && total_len < buffer.len() {
-            match socket.read(&mut buffer[total_len..]).await {
+            match server_socket.read(&mut buffer[total_len..]).await {
                 Ok(0) => break,
                 Ok(n) => {
                     total_len += n;
@@ -367,115 +378,86 @@ async fn main(spawner: Spawner) -> ! {
             println!("Credentials saved to NVS");
 
             // Respond with a confirmation page
-            let _ = socket
+            let _ = server_socket
                 .write_all(
                     b"HTTP/1.0 200 OK\r\n\r\n\
-                <html>\
-                    <body>\
-                    RESTARTING NOW!
-                    </body>\
-                </html>\r\n\
-                ",
+                    <html>\
+                        <body>\
+                        RESTARTING NOW!
+                        </body>\
+                    </html>\r\n\
+                    ",
                 )
                 .await;
 
             Timer::after(Duration::from_secs(5)).await;
             esp_hal::system::software_reset();
         } else {
-            let _ = socket
+            let r = server_socket
                 .write_all(
                     b"HTTP/1.0 200 OK\r\n\r\n\
-                <html>\
-                    <body>\
-                        <form method='post'>\
-                            <label for='ssid'>SSID:</label>\
-                            <input type='text' id='ssid' name='ssid'><br><br>\
-                            <label for='password'>Password:</label>\
-                            <input type='password' id='password' name='password'><br><br>\
-                            <input type='submit' value='Submit'>\
-                        </form>\
-                    </body>\
-                </html>\r\n\
-                ",
+                            <html>\
+                            <body>\
+                                <form method='post'>\
+                                    <label for='ssid'>SSID:</label>\
+                                    <input type='text' id='ssid' name='ssid'><br><br>\
+                                    <label for='password'>Password:</label>\
+                                    <input type='password' id='password' name='password'><br><br>\
+                                    <input type='submit' value='Submit'>\
+                                </form>\
+                            </body>\
+                            </html>\r\n\
+                            ",
                 )
                 .await;
-        }
+            if let Err(e) = r {
+                println!("AP write error: {:?}", e);
+            }
 
-        let _ = socket.flush().await;
-        Timer::after(Duration::from_millis(1000)).await;
-        socket.close();
-        Timer::after(Duration::from_millis(1000)).await;
-        socket.abort();
+            let r = server_socket.flush().await;
+            if let Err(e) = r {
+                println!("AP flush error: {:?}", e);
+            }
+            Timer::after(Duration::from_millis(1000)).await;
+            server_socket.close();
+            Timer::after(Duration::from_millis(1000)).await;
+            server_socket.abort();
+        }
     }
 }
 
-async fn connect_sta_task(
-    ap_config: AccessPointConfiguration,
-    mut controller: WifiController<'static>,
-    ssid: String,
-    password: String,
-) -> Result<(), ()> {
-    let sta_cfg = ClientConfiguration {
-        ssid,
-        password,
-        ..Default::default()
-    };
-    controller
-        .set_configuration(&Configuration::Mixed(sta_cfg, ap_config.clone()))
-        .unwrap();
-
-    with_timeout(
-        Duration::from_secs(10),
-        controller.wait_for_event(WifiEvent::StaConnected),
-    )
-    .await
-    .map_err(|e| {
-        println!("Timeout while waiting for STA connection: {:?}", e);
-        ()
-    })
-}
-
 #[embassy_executor::task]
-async fn run_dhcp(stack: Stack<'static>, gw_ip_addr: &'static str) {
-    use core::net::{Ipv4Addr, SocketAddrV4};
+async fn connection(mut controller: WifiController<'static>) {
+    println!("start connection task");
+    println!("Device capabilities: {:?}", controller.capabilities());
 
-    use edge_dhcp::{
-        io::{self, DEFAULT_SERVER_PORT},
-        server::{Server, ServerOptions},
-    };
-    use edge_nal::UdpBind;
-    use edge_nal_embassy::{Udp, UdpBuffers};
-
-    let ip = Ipv4Addr::from_str(gw_ip_addr).expect("dhcp task failed to parse gw ip");
-
-    let mut buf = [0u8; 1500];
-
-    let mut gw_buf = [Ipv4Addr::UNSPECIFIED];
-
-    let buffers = UdpBuffers::<3, 1024, 1024, 10>::new();
-    let unbound_socket = Udp::new(stack, &buffers);
-    let mut bound_socket = unbound_socket
-        .bind(core::net::SocketAddr::V4(SocketAddrV4::new(
-            Ipv4Addr::UNSPECIFIED,
-            DEFAULT_SERVER_PORT,
-        )))
-        .await
-        .unwrap();
+    println!("Starting wifi");
+    controller.start_async().await.unwrap();
+    println!("Wifi started!");
 
     loop {
-        _ = io::server::run(
-            &mut Server::<_, 64>::new_with_et(ip),
-            &ServerOptions::new(ip, Some(&mut gw_buf)),
-            &mut bound_socket,
-            &mut buf,
-        )
-        .await
-        .inspect_err(|e| log::warn!("DHCP server error: {e:?}"));
-        Timer::after(Duration::from_millis(500)).await;
+        match esp_wifi::wifi::ap_state() {
+            WifiState::ApStarted => {
+                println!("About to connect...");
+
+                match controller.connect_async().await {
+                    Ok(_) => {
+                        // wait until we're no longer connected
+                        controller.wait_for_event(WifiEvent::StaDisconnected).await;
+                        println!("STA disconnected");
+                    }
+                    Err(e) => {
+                        println!("Failed to connect to wifi: {e:?}");
+                        Timer::after(Duration::from_millis(5000)).await
+                    }
+                }
+            }
+            _ => return,
+        }
     }
 }
 
-#[embassy_executor::task]
+#[embassy_executor::task(pool_size = 2)]
 async fn net_task(mut runner: Runner<'static, WifiDevice<'static>>) {
     runner.run().await
 }
