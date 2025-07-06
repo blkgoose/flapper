@@ -34,7 +34,6 @@
     in {
       
       schemas = flake-schemas.schemas;
-
       
       devShells = forEachSupportedSystem ({ pkgs }: {
         default = pkgs.mkShell {

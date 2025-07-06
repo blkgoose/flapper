@@ -2,16 +2,25 @@
 #![no_main]
 
 extern crate alloc;
+use alloc::format;
 use alloc::string::String;
 use alloc::vec::Vec;
+use core::fmt::Write as FmtWrite;
 use core::net::Ipv4Addr;
+use embedded_tls::{CryptoRng, UnsecureProvider};
+use rand_chacha::ChaCha8Rng;
+use rand_core::{RngCore, SeedableRng};
+// use rand_core::{CryptoRng, RngCore};
+use esp_hal::rng::Trng;
 
 use embassy_executor::Spawner;
 use embassy_net::{
     tcp::TcpSocket, IpListenEndpoint, Ipv4Cidr, Runner, StackResources, StaticConfigV4,
 };
 use embassy_time::{Duration, Timer};
+use embedded_io_async::{Read, Write};
 use embedded_storage::{ReadStorage, Storage};
+use embedded_tls::{Aes128GcmSha256, TlsConfig, TlsConnection, TlsContext};
 use esp_alloc as _;
 use esp_backtrace as _;
 use esp_bootloader_esp_idf::partitions;
@@ -260,21 +269,18 @@ async fn main(spawner: Spawner) -> ! {
     }
     let mut ap_server_rx_buffer = [0; BUFFER_SIZE];
     let mut ap_server_tx_buffer = [0; BUFFER_SIZE];
-    let mut sta_client_rx_buffer = [0; BUFFER_SIZE];
-    let mut sta_client_tx_buffer = [0; BUFFER_SIZE];
 
     let mut ap_server_socket =
         TcpSocket::new(ap_stack, &mut ap_server_rx_buffer, &mut ap_server_tx_buffer);
     ap_server_socket.set_timeout(Some(embassy_time::Duration::from_secs(10)));
 
-    let mut sta_client_socket = TcpSocket::new(
-        sta_stack,
-        &mut sta_client_rx_buffer,
-        &mut sta_client_tx_buffer,
-    );
-    sta_client_socket.set_timeout(Some(embassy_time::Duration::from_secs(10)));
-
     loop {
+        println!("fetching bus info");
+        let info = fetch_bus_update(sta_stack, rng)
+            .await
+            .expect("Failed to fetch bus update");
+        println!("Bus info: {}", info);
+
         println!("Wait for connection...");
         ap_server_socket
             .accept(IpListenEndpoint {
@@ -287,7 +293,6 @@ async fn main(spawner: Spawner) -> ! {
         let server_socket = &mut ap_server_socket;
         println!("Connected...");
 
-        use embedded_io_async::Write;
         let mut buffer = [0u8; 1024];
 
         let mut total_len = 0;
@@ -461,3 +466,105 @@ async fn connection(mut controller: WifiController<'static>) {
 async fn net_task(mut runner: Runner<'static, WifiDevice<'static>>) {
     runner.run().await
 }
+
+async fn fetch_bus_update(stack: embassy_net::Stack<'static>, rng: Rng) -> Result<u32, i32> {
+    let mut tx_buf = [0; BUFFER_SIZE];
+    let mut rx_buf = [0; BUFFER_SIZE];
+
+    let server = "giromilano.atm.it";
+
+    // 1. Resolve the host to an IP address (if DNS is available in your stack)
+    let mut seed = [0u8; 32];
+    for chunk in seed.chunks_mut(4) {
+        let value = rng.random().to_le_bytes();
+        chunk.copy_from_slice(&value[..chunk.len()]);
+    }
+    let rng = MyChaCha8Rng(ChaCha8Rng::from_seed(seed));
+
+    let config = TlsConfig::new().with_server_name(server);
+    let mut read_record_buffer = [0; 16384];
+    let mut write_record_buffer = [0; 16384];
+
+    let addr = stack
+        .dns_query(server, embassy_net::dns::DnsQueryType::A)
+        .await
+        .map_err(|e| {
+            println!("err: {:?}", e);
+            1
+        })?
+        .into_iter()
+        .next()
+        .ok_or(2)?;
+
+    // 2. Open TCP socket to host:80
+    let mut socket = TcpSocket::new(stack, &mut rx_buf, &mut tx_buf);
+    let mut tls = TlsConnection::new(socket, &mut read_record_buffer, &mut write_record_buffer);
+    socket.set_timeout(Some(embassy_time::Duration::from_secs(10)));
+    socket.connect((addr.clone(), 80)).await.map_err(|_| 3)?;
+
+    let config = TlsConfig::new().with_server_name(server);
+    let mut read_record_buffer = [0; 16384];
+    let mut write_record_buffer = [0; 16384];
+    let mut tls = TlsConnection::new(socket, &mut read_record_buffer, &mut write_record_buffer);
+
+    // 3. Write HTTP GET request
+    let request = format!(
+        "GET {} HTTP/1.0\r\n\
+        Host: {}\r\n\
+        User-Agent: Mozilla/5.0 (X11; Ubuntu; Linux x86_64; rv:122.0) Gecko/20100101 Firefox/122.0\r\n\
+        Content-Type: application/x-www-form-urlencoded;charset=utf-8\r\n\
+        Accept-Language: en-US,en;q=0.5\r\n\
+        Referer: https://giromilano.atm.it/\r\n\
+        cookie: TS01ac3475=0199b2c74a586b2cd3f979a7ee12300ddcc689b1fefbbbc91f6642ce9f2d4ff46133460b04f410c5a5d64ffea5e2b6581194aaeabc\r\n\
+        ",
+        "proxy.tpportal/proxy.ashx", server
+    );
+
+    tls.open(TlsContext::new(
+        &config,
+        UnsecureProvider::new::<Aes128GcmSha256>(rng),
+    ))
+    .await
+    .expect("error establishing TLS connection");
+
+    tls.write_all(request.as_bytes())
+        .await
+        .expect("error writing data");
+    tls.flush().await.expect("error flushing data");
+
+    // 4. Read response into rx_buf
+    // You may want to parse headers, handle chunked encoding, etc. For now, just read raw bytes.
+    let mut output = [0u8; 4096 * 8];
+    let sz = tls.read(&mut output[..]).await.expect("error reading data");
+
+    let r = format!(
+        "{}",
+        core::str::from_utf8(&output).unwrap_or("[invalid utf8]")
+    );
+
+    println!("Response: {}", r);
+
+    // gets json body
+    // parse body and extract ".Lines[].WaitMessage"
+    // remove "min"
+    // order ascending by time
+    // return first line
+
+    Ok(12)
+}
+
+pub struct MyChaCha8Rng(pub ChaCha8Rng);
+
+impl RngCore for MyChaCha8Rng {
+    fn next_u32(&mut self) -> u32 {
+        self.0.next_u32()
+    }
+    fn next_u64(&mut self) -> u64 {
+        self.0.next_u64()
+    }
+    fn fill_bytes(&mut self, dest: &mut [u8]) {
+        self.0.fill_bytes(dest)
+    }
+}
+
+impl CryptoRng for MyChaCha8Rng {}
